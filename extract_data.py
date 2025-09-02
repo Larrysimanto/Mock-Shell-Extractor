@@ -3,179 +3,75 @@ import pandas as pd
 import re
 import os
 
-def extract_title_from_page(page):
+def extract_title_info(page):
     """
-    Extracts the title from a single PDF page.
+    Extracts the title, id, and population from a single PDF page.
+    The title is assumed to be a 3-line block.
+    Page number patterns are removed from the title components.
     """
     text_lines = page.extract_text().split('\n')
-    for line in text_lines:
-        if re.match(r'^(Table|Figure|Listing)\s[\d\.]+\s?.*', line):
-            return line.strip()
-    return ""
-
-def extract_footnotes_from_page(page):
-    """
-    Extracts footnotes from a single PDF page by identifying content blocks
-    that exist between a horizontal separator line and the next major title.
     
-    Args:
-        page: A pdfplumber page object.
+    page_num_pattern = r'Page\s*\d+\s*of\s*\d+'
 
-    Returns:
-        list: A list of strings, where each string is a line from any
-              footnote block found on the page.
-    """
-    # 1. Define a pattern for major titles (e.g., "Table 1.1", "Figure 2.3")
-    title_pattern = re.compile(r'^(Table|Figure)\s+\d+(\.\d+)*')
-    
-    # 2. Find all "anchors" on the page: horizontal lines and titles.
-    # Get all horizontal lines with their y-coordinate.
-    lines = [{'type': 'line', 'y': l['y0']} for l in page.lines if l['y0'] == l['y1']]
-    
-    # Get all titles with their top y-coordinate using pdfplumber's search.
-    # page.search is more robust for finding coordinates of text.
-    titles = [{'type': 'title', 'y': t['top']} for t in page.search(title_pattern)]
-
-    # Combine all anchors into one list.
-    anchors = lines + titles
-    
-    # Also add the very bottom of the page as a final anchor to cap the last block.
-    anchors.append({'type': 'page_bottom', 'y': page.height})
-
-    if not lines:
-        # If there are no separator lines, we can't find any footnotes with this method.
-        return []
-
-    # 3. Sort anchors from top to bottom to map the page structure.
-    sorted_anchors = sorted(anchors, key=lambda x: x['y'])
-    
-    all_footnotes_on_page = []
-
-    # 4. Iterate through the map to find blocks that start with a line.
-    for i, anchor in enumerate(sorted_anchors):
-        if anchor['type'] == 'line':
-            # This is the start of a potential footnote block.
-            # The block ends at the position of the *next* anchor.
-            if i + 1 < len(sorted_anchors):
-                start_y = anchor['y']
-                end_y = sorted_anchors[i+1]['y']
+    for i, line in enumerate(text_lines):
+        line = line.strip()
+        # Pattern for the first line of a title (e.g., "Table 1.1")
+        title_start_pattern = r'^(Table|Figure|Listing)\s+[\d\.]+'
+        
+        if re.match(title_start_pattern, line, re.IGNORECASE):
+            # We found the start of a title. The next 2 lines are part of it.
+            if i + 2 < len(text_lines):
                 
-                # Define the precise bounding box for this block.
-                bbox = (0, start_y, page.width, end_y)
+                # Clean page numbers from the title lines
+                output_id = re.sub(page_num_pattern, '', line, flags=re.IGNORECASE).strip()
+                title_name = re.sub(page_num_pattern, '', text_lines[i+1], flags=re.IGNORECASE).strip()
+                population = re.sub(page_num_pattern, '', text_lines[i+2], flags=re.IGNORECASE).strip()
                 
-                # Crop, extract, and process the text within this specific block.
-                text = page.crop(bbox).extract_text()
-                
-                if text:
-                    found_lines = text.split('\n')
-                    for line in found_lines:
-                        clean_line = line.strip()
-                        if clean_line and not re.match(r'^Page\s*\d+', clean_line, re.IGNORECASE):
-                            all_footnotes_on_page.append(clean_line)
+                return {
+                    "id": output_id,
+                    "title": title_name,
+                    "population": population
+                }
+    return None
 
-    return all_footnotes_on_page
-
-def extract_footnotes_with_line(page):
+def extract_footnotes(page):
     """
-    Extracts footnotes from a single PDF page by first finding a
-    horizontal separator line and then parsing the text below it.
+    Extracts footnotes from a single PDF page. Footnotes are defined as the
+    text appearing after the 3rd horizontal line on the page.
+    Lines starting with "programming Note" are ignored.
     """
-    horizontal_lines = [line for line in page.lines if line['y0'] == line['y1']]
+    # 1. Find all horizontal lines and sort them from top to bottom.
+    horizontal_lines = sorted([line for line in page.lines if line['y0'] == line['y1']], key=lambda line: line['y0'])
 
-    if not horizontal_lines:
-        return {}
+    # 2. Check if there are at least 3 lines.
+    if len(horizontal_lines) < 3:
+        print(f"Found {len(horizontal_lines)} horizontal lines on page {page.page_number}.")
+        return "" # Not enough lines to find the 3rd one.
 
-    separator_line = max(horizontal_lines, key=lambda line: line['y0'])
-    separator_y = separator_line['y0']
+    # 3. Get the 3rd horizontal line.
+    third_line = horizontal_lines[2]
+    third_line_y = third_line['y0']
 
-    # Find titles below the separator line
-    text_lines = page.extract_text(y_start=separator_y).split('\n')
-    next_title_y = page.height
-    for line in text_lines:
-        if re.match(r'^(Table|Figure|Listing)\s[\d\.]+\s?:.*', line):
-            # Find the y-coordinate of this line
-            for char in page.chars:
-                if char['text'] == line[0]:
-                    next_title_y = char['top']
-                    break
-            break
-
-    bbox = (0, separator_y, page.width, next_title_y)
-    footnote_area = page.crop(bbox)
-    text = footnote_area.extract_text()
-
-    if not text:
-        return {}
-
-    footnote_pattern = re.compile(r'^\((\d+)\)(.*)')
+    # 4. Define the bounding box for the footnote area.
+    bbox = (0, third_line_y, page.width, page.height)
     
-    footnotes = {}
-    current_source_id = None
-    lines = text.split('\n')
+    # 5. Crop the page and extract text.
+    footnote_text = page.crop(bbox).extract_text()
 
-    for line in lines:
-        match = footnote_pattern.match(line.strip())
-        if match:
-            source_id = int(match.group(1))
-            footnote_text = match.group(2).strip()
-            footnotes[source_id] = footnote_text
-            current_source_id = source_id
-        elif current_source_id is not None and line.strip():
-            footnotes[current_source_id] += ' ' + line.strip()
-            
-    return footnotes
+    if not footnote_text:
+        return ""
 
-def extract_footnotes_with_line2(page):
-    """
-    Extracts footnotes from a single PDF page by identifying content blocks
-    that exist between a horizontal separator line and the next major title.
-    It assigns sequential numbers to each found line to create a dictionary.
-    """
-    # 1. Define a pattern for major titles (Table/Figure/Listing X.X:)
-    title_pattern = re.compile(r'^(Table|Figure|Listing)\s+[\d\.]+\s?:.*', re.IGNORECASE)
-    
-    # 2. Find all "anchors" on the page: horizontal lines and titles.
-    lines = [{'type': 'line', 'y': l['y0']} for l in page.lines if l['y0'] == l['y1']]
-    titles = [{'type': 'title', 'y': t['top']} for t in page.search(title_pattern)]
-    anchors = lines + titles
-    anchors.append({'type': 'page_bottom', 'y': page.height})
-
-    if not lines:
-        return {} # Return an empty dictionary as required
-
-    # 3. Sort anchors from top to bottom to map the page structure.
-    sorted_anchors = sorted(anchors, key=lambda x: x['y'])
-    
-    final_footnotes_dict = {}
-    # Initialize a counter to assign a unique ID to each footnote line.
-    footnote_counter = 1
-
-    # 4. Iterate through the map to find and process each block starting with a line.
-    for i, anchor in enumerate(sorted_anchors):
-        if anchor['type'] == 'line':
-            if i + 1 < len(sorted_anchors):
-                start_y = anchor['y']
-                end_y = sorted_anchors[i+1]['y']
-                
-                bbox = (0, start_y, page.width, end_y)
-                text = page.crop(bbox).extract_text()
-                
-                if not text:
-                    continue
-
-                # 5. Process each line found in the block.
-                found_lines = text.split('\n')
-                for line in found_lines:
-                    clean_line = line.strip()
-                    # Filter out any empty lines or lines that are just page numbers.
-                    if clean_line and not re.match(r'^Page\s*\d+', clean_line, re.IGNORECASE):
-                        # Assign the current count as the key and the line as the value.
-                        final_footnotes_dict[footnote_counter] = clean_line
-                        # Increment the counter for the next footnote line.
-                        footnote_counter += 1
+    # 6. Process the extracted text.
+    footnotes = []
+    found_lines = footnote_text.split('\n')
+    for line in found_lines:
+        clean_line = line.strip()
+        if clean_line and not re.match(r'^Page\s*\d+', clean_line, re.IGNORECASE):
+            if '─' not in clean_line and '_' not in clean_line:
+                if not clean_line.lower().startswith("programming note"):
+                    footnotes.append(clean_line)
                             
-    return final_footnotes_dict
-
+    return " | ".join(footnotes)
 
 def extract_data_from_pdf(pdf_path):
     """
@@ -192,20 +88,21 @@ def extract_data_from_pdf(pdf_path):
         
         for i, page in enumerate(pdf.pages):
             page_number = i + 1
-            title = extract_title_from_page(page)
+            title_info = extract_title_info(page)
             
-            if title:
-                footnotes_dict = extract_footnotes_with_line2(page)
-                footnotes = [f"({key}) {value}" for key, value in footnotes_dict.items()]
+            if title_info:
+                footnotes = extract_footnotes(page)
+                
                 extracted_data.append({
                     "Page": page_number,
-                    "Title": title,
-                    "Footnotes": " | ".join(footnotes) if footnotes else "N/A"
+                    "id": title_info["id"],
+                    "title": title_info["title"],
+                    "population": title_info["population"],
+                    "Footnotes": footnotes if footnotes else "N/A"
                 })
 
     print("Extraction complete.")
     return extracted_data
-
 
 def save_to_excel(data, output_path):
     """
@@ -216,7 +113,7 @@ def save_to_excel(data, output_path):
         return
 
     df = pd.DataFrame(data)
-    df = df[['Page', 'Title', 'Footnotes']]
+    df = df[['Page', 'id', 'title', 'population', 'Footnotes']]
     df.to_excel(output_path, index=False)
     print(f"Successfully saved data to '{output_path}'")
 
@@ -224,11 +121,10 @@ def main():
     """
     Main function to run the data extraction and saving process.
     """
-    PDF_FILE = "sample_mock.pdf"
+    PDF_FILE = "DMC_shell.pdf"
     EXCEL_OUTPUT_FILE = "clinical_study_report_summary.xlsx"
     
     report_data = extract_data_from_pdf(PDF_FILE)
-    print(report_data)
     
     if report_data:
         save_to_excel(report_data, EXCEL_OUTPUT_FILE)
